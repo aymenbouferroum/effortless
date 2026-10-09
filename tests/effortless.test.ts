@@ -1,7 +1,7 @@
 import { describe, expect, mock, test as baseTest } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import type { Engine } from 'claude-code/testing'
-import { looksLikeRedo, REDO_STAY_PROMPTS, routeWorth, syncPlan, tipped, bounded, handoffEvidence, parseHandoffAnswer, withJevKey, parseVerdict, capped, resetLabel, HANDOFF_PROMPT, handoffMessage, withAttachments, endsOnQuestion, keepsEffort, benchGrade, benchReport, judgeFailure, contextFrom, readConfig, asSpent, cacheColor, cacheLabel, cacheClock, cacheSafe, cacheTtlOf, mostlyCached, isFollowUp, parseJevAnswer, parseJevKey, savedText, forkOutcome, setupNext, setupBack, setupCounter, dashboardLines, flashColor, handoffGlowStep, weighted, handoffLook, isNewer, latestRelease, updateSnoozed, updateFailure, compactTranscript, judgeGlowSvg, judgeGlowAt, judgeBrightnessAt, JUDGE_RISE_MS, JUDGE_FADE_MS, JUDGE_STEP_MS, JUDGE_PIECE_MS } from '../hooks/register'
+import { looksLikeRedo, REDO_STAY_PROMPTS, routeWorth, contextAgainst, syncPlan, tipped, bounded, handoffEvidence, parseHandoffAnswer, withJevKey, parseVerdict, capped, resetLabel, HANDOFF_PROMPT, handoffMessage, withAttachments, endsOnQuestion, keepsEffort, benchGrade, benchReport, judgeFailure, contextFrom, readConfig, asSpent, cacheColor, cacheLabel, cacheClock, cacheSafe, cacheTtlOf, mostlyCached, isFollowUp, parseJevAnswer, parseJevKey, savedText, forkOutcome, setupNext, setupBack, setupCounter, dashboardLines, flashColor, handoffGlowStep, weighted, handoffLook, isNewer, latestRelease, updateSnoozed, updateFailure, compactTranscript, judgeGlowSvg, judgeGlowAt, judgeBrightnessAt, JUDGE_RISE_MS, JUDGE_FADE_MS, JUDGE_STEP_MS, JUDGE_PIECE_MS } from '../hooks/register'
 import { ART_COLUMNS, artFrame, artPixel, MOVING } from '../hooks/art'
 import { setTheme, themedSvg, tint, tintHex } from '../hooks/theme'
 import { importsOf, moduleLinks, moduleOf, relPath, withTouch } from '../hooks/agents'
@@ -49,8 +49,8 @@ function judgeSays(on: On, text: string) {
 }
 
 /** What sits beneath the plugins in a session: the prompt goes through, the status line takes text. */
-function engine(on: On, env: Record<string, string> = {}, sessionModel = 'claude-opus-5-5', said: { role: string; text: string }[] = []) {
-  mock.store(on)
+function engine(on: On, env: Record<string, string> = {}, sessionModel = 'claude-opus-5-5', said: { role: string; text: string }[] = [], stored: Record<string, unknown> = {}) {
+  mock.store(on, stored)
   mock.env(on, { EFFORTLESS_MODEL_UI: '1', ...env })
   on('prompt.submit', (_$, e) => ({ text: e.text }))
   on('ui.status', () => ({ value: undefined }))
@@ -440,10 +440,10 @@ describe('footer text', () => {
     const text = await drawn(footer)
     expect(text).toContain(`"color":"${PURPLE}"`)
     expect(text).toContain('"children":[" Auto "]')
-    // The only button is the small switch for Auto: no label other than the power glyph, not the lit look.
+    // The only button is the small switch for Auto: no label other than its circle, not the lit look.
     // The Auto switch, the setup (or settings gear) and the handoff symbol.
     expect(text.match(/"type":"Button"/g)?.length).toBe(3)
-    expect(text).toContain('"label":" ⏻ "')
+    expect(text).toContain('"label":" ● "')
     // No frame of its own (it drew wide and cut off): plain, with the same grey box as the level on hover.
     expect(text).toContain('"plain":true')
     expect(text).toContain('"hover":{"scope":"power","backgroundColor":"#2b2b2f"}')
@@ -478,11 +478,15 @@ describe('footer text', () => {
     const off = await drawn(footer)
     expect(off).toContain('"children":[" Off "]')
     expect(off).not.toContain(`"color":"${PURPLE}"`)
+    // The switch shows an empty circle while Auto is off.
+    expect(off).toContain('"label":" ○ "')
     await $.prompt.submit({ text: 'en till', wait: false, origin: { kind: 'composer' } })
     expect(asked.length).toBe(1)
 
     await footer.press({ key: 'auto' })
-    expect(await drawn(footer)).toContain(`"color":"${PURPLE}"`)
+    const on2 = await drawn(footer)
+    expect(on2).toContain(`"color":"${PURPLE}"`)
+    expect(on2).toContain('"label":" ● "')
 
     // The command does the same.
     expect(await auto($)).toContain('Auto off')
@@ -503,6 +507,54 @@ describe('footer text', () => {
     await step($, 'low')
     expect(await drawn(footer)).toContain('"children":[" Off "]')
     await footer.unmount()
+  })
+
+  test("Auto switched off hands the effort back to the app: the judge's last pick no longer applies", async ($, on) => {
+    engine(on)
+    judgeSays(on, '{"model":"opus","effort":"high","why":"hard"}')
+    const sent = recordSteps(on)
+    const footer = await $.ui.mount(FOOTER)
+    await $.prompt.submit({ text: 'hard task', wait: false, origin: { kind: 'composer' } })
+    await step($, 'medium')
+    expect(sent.at(-1)?.effort).toBe('high')
+    await footer.press({ key: 'auto' })
+    await $.prompt.submit({ text: 'another task', wait: false, origin: { kind: 'composer' } })
+    await step($, 'medium')
+    expect(sent.at(-1)?.effort).toBe('medium')
+    await footer.unmount()
+  })
+
+  // The store is shared by every chat. A pick made by hand with Auto off comes back in its own chat (opened again),
+  // and never in another: a new chat, or an agent started with its own --effort, runs at the effort the app gives it.
+  for (const [chat, expected] of [['chat-1234-same', 'xhigh'], ['chat-9999-other', 'medium']] as const) {
+    test(`a pick made by hand in one chat is not forced on another (${expected})`, async ($, on) => {
+      engine(on, {}, 'claude-opus-5-5', [], { isAuto: false, setupDone: true, pick: { model: 'opus', effort: 'xhigh', why: 'your pick', by: 'manual' }, pickChat: 'chat-123' })
+      on('session.id', () => ({ value: chat }) as never)
+      on('session.start', (_$, e) => ({ cwd: e.cwd }) as never)
+      on('command.register', () => ({ value: undefined }) as never)
+      const sent = recordSteps(on)
+      await $.session.start({ cwd: '.', surface: 'desktop', isInteractive: true } as never)
+      await step($, 'medium')
+      expect(sent.at(-1)?.effort).toBe(expected)
+    })
+  }
+
+  test('a pick made after a reload, with no session start, still names its chat', async ($, on) => {
+    // Registered before the store mock, so it sits outside it and sees each write.
+    const named: unknown[] = []
+    on('store.set', { key: 'pickChat' }, (_$, e, next) => {
+      named.push(e.value)
+      return next(e)
+    })
+    engine(on)
+    judgeSays(on, '{"model":"sonnet","effort":"high","why":"hard"}')
+    recordSteps(on)
+    on('session.id', () => ({ value: 'chat-1234-same' }) as never)
+    await $.prompt.submit({ text: 'hard task', wait: false, origin: { kind: 'composer' } })
+    await step($, 'medium')
+    // The person picks another effort in the app: a pick by hand.
+    await step($, 'low')
+    expect(named.at(-1)).toBe('chat-123')
   })
 
   test('on Haiku there is no effort to name', async ($, on) => {
@@ -2778,6 +2830,31 @@ describe('dashboard', () => {
     expect(await drawn(band)).toContain('⇥ Handoff')
     await band.unmount()
     await expect($.ui.mount(FOOTER)).rejects.toThrow()
+  })
+
+  test('a chat that compacts at 350k on a 1M model reads its share of 350k, not of 1M', DASH, async ($, on) => {
+    engine(on)
+    const mocked = mock.clock(on)
+    const context = { tokens: 175_000, window: 1_000_000, percent: 18 }
+    on('session.usage', (_$, e) =>
+      ({ value: { context: (e as { breakdown?: string } | undefined)?.breakdown ? { ...context, breakdown: { rawMaxTokens: 350_000, autocompactSource: 'settings' } } : context } }) as never)
+    await start($, on)
+    await closeSetup($, DESK_BAND)
+    await mocked.advance(16_000)
+    const band = await $.ui.mount(DESK_BAND)
+    expect(await drawn(band)).toContain('"children":["50%"]')
+    await band.unmount()
+  })
+
+  test('the compaction window only counts when it is smaller than the model window', () => {
+    const context = { tokens: 175_000, window: 1_000_000, percent: 18 }
+    expect(contextAgainst(context, 350_000)).toEqual({ tokens: 175_000, window: 350_000, percent: 50 })
+    expect(contextAgainst(context, undefined)).toBe(context)
+    expect(contextAgainst(context, 1_000_000)).toBe(context)
+    expect(contextAgainst({ ...context, tokens: 400_000 }, 350_000).percent).toBe(100)
+    expect(contextAgainst({ ...context, tokens: 180_000 }, 350_000).percent).toBe(51)
+    // Before the first response there are no tokens: nothing to measure yet.
+    expect(contextAgainst({ window: 1_000_000 }, 350_000)).toEqual({ window: 350_000, percent: undefined })
   })
 
   test('Handoff button set to always: Handoff from the start, calm, no glow, with Compact beside it', { options: { layout: 'default', handoffButton: 'always' } } as never, async ($, on) => {

@@ -1350,8 +1350,35 @@ async function previewPercent($: EngineInterface): Promise<number | undefined> {
   }
 }
 
+/** The window the chat really fills: the compaction window when it is smaller than the model's (autoCompactWindow,
+ * CLAUDE_CODE_AUTO_COMPACT_WINDOW), so a chat that compacts at 350k on a 1M model reads 100% there, not 35%. */
+export function contextAgainst<T extends { tokens?: number; window: number; percent?: number }>(context: T, compactAt: number | undefined): T {
+  if (!compactAt || !context.window || compactAt >= context.window) return context
+  // A whole number, as the app's own share is: the band prints it as it is.
+  const percent = context.tokens === undefined ? context.percent : Math.min(100, Math.round((context.tokens / compactAt) * 100))
+  return { ...context, window: compactAt, percent }
+}
+
+// The compaction window and the model window it was read for: /context's breakdown measures against it. Read again
+// when the model's window changes (a switch of model); a settings change reloads the mod and starts over.
+let compactWindow: { model: number; at: number | undefined } | undefined
+async function compactWindowFor($: EngineInterface, context: { tokens?: number; window: number }): Promise<number | undefined> {
+  if (!context.window) return undefined
+  if (compactWindow?.model === context.window) return compactWindow.at
+  // The breakdown needs a session with a response: before one, read it on a later check.
+  if (context.tokens === undefined) return undefined
+  const usage = await $.session.usage({ breakdown: 'summary' }).catch(() => undefined)
+  // No breakdown (an engine without one) is kept too, so the 15 s check does not ask again each time.
+  const at = usage?.context.breakdown?.rawMaxTokens || undefined
+  compactWindow = { model: context.window, at }
+  if (at) void proof($, `context window ${context.window}, compacts at ${at} (${usage?.context.breakdown?.autocompactSource ?? '?'})`)
+  return at
+}
+
 async function checkSwamp($: EngineInterface) {
-  const { context, rateLimits } = await $.session.usage()
+  const usage = await $.session.usage()
+  const rateLimits = usage.rateLimits
+  const context = contextAgainst(usage.context, await compactWindowFor($, usage.context))
   const preview = await previewPercent($)
   const tokens = preview === undefined ? (context.tokens ?? 0) : Math.round(((context.window || 200_000) * preview) / 100)
   // The app may leave the percent out (or give 0) while it has the tokens and the window: work it out then.
@@ -2038,11 +2065,16 @@ async function toggleAutoEffort($: EngineInterface) {
   const turnOn = !(await read($, isAuto))
   await update($, isAuto, () => turnOn)
   await $.store.set('isAuto', turnOn)
+  // Off hands the effort back to the app's own control: the judge's last pick stops applying. One picked by hand stays.
+  if (!turnOn && (await read($, pick))?.by !== 'manual') await choose($, null)
 }
 
 async function choose($: EngineInterface, next: Pick | null) {
   const before = await read($, pick)
-  await Promise.all([update($, pick, () => next), $.store.set('pick', next)])
+  // The store is shared by every chat: the pick names its chat, so only that chat takes it back (see session.start).
+  // After /reload-plugins or a settings change there was no session start to name it, so ask.
+  const chat = loadedSession !== '-' ? loadedSession : String(await $.session.id().catch(() => '-')).slice(0, 8)
+  await Promise.all([update($, pick, () => next), $.store.set('pick', next), $.store.set('pickChat', chat)])
   // A change Auto made is shown as "Low → High" for a moment, so the switch is seen.
   if (next && next.by !== 'manual' && before && before.model !== 'haiku' && before.effort !== next.effort) {
     const change = { from: before.effort, to: next.effort }
@@ -2136,7 +2168,7 @@ type Snap = Awaited<ReturnType<typeof snap>>
 /** The hover cards' text: what Auto did and why, and what the cache countdown means with the context it guards. */
 function hoverTips(v: Snap): { effort: string; cache: string } {
   const effortTip = !v.auto
-    ? 'Auto is off: the effort stays as you set it. The power button turns Auto on.'
+    ? 'Auto is off: the effort stays as you set it. The ○ at the bottom turns Auto on.'
     : v.pausedNow
       ? 'Auto waits on this model: an effort change would rewrite its prompt cache.'
       : !effortOf(v, v.modelNow ?? 'sonnet')
@@ -3583,15 +3615,18 @@ export const register: Register = (on, options) => {
   })
   on('session.start', async ($, e, next) => {
     sessionStarted = Date.now()
+    // Each chat reads its own compaction window (its model, its --settings).
+    compactWindow = undefined
     // Everything the first draw needs, asked for at once: one after the other they held the start (and with it the
     // band) for a second or more. What the draw does not need runs after, unawaited.
-    const [sid, kept, kff, storedAuto, storedAutoModel, storedPick, setupDone] = await Promise.all([
+    const [sid, kept, kff, storedAuto, storedAutoModel, storedPick, storedPickChat, setupDone] = await Promise.all([
       $.session.id().catch(() => '?'),
       $.store.get('savedSettings').catch(() => null),
       $.store.get('keyFromFile').catch(() => null),
       $.store.get('isAuto').catch(() => null),
       $.store.get('isAutoModel').catch(() => null),
       $.store.get('pick').catch(() => null) as Promise<Pick | null>,
+      $.store.get('pickChat').catch(() => null),
       $.store.get('setupDone').catch(() => null),
     ])
     // Which chat this load serves, and when it started: each chat has its own render log.
@@ -3605,8 +3640,11 @@ export const register: Register = (on, options) => {
     await Promise.all([
       typeof storedAuto === 'boolean' ? update($, isAuto, () => storedAuto) : null,
       typeof storedAutoModel === 'boolean' ? update($, isAutoModel, () => storedAutoModel) : null,
-      // Auto off means the effort you chose should still be the one in force.
-      storedAuto === false && storedPick && EFFORTS.includes(storedPick.effort) ? update($, pick, () => storedPick) : null,
+      // Auto off means the effort you chose should still be the one in force: in the chat you chose it in. Another
+      // chat (a new one, an agent started with its own --effort) keeps the effort the app gives it.
+      storedAuto === false && storedPick?.by === 'manual' && EFFORTS.includes(storedPick.effort) && sid !== '?' && storedPickChat === loadedSession
+        ? update($, pick, () => storedPick)
+        : null,
       // The first time the mod runs, the setup guide opens above the prompt.
       setupDone !== true ? update($, setupStep, () => 'pick').then(() => update($, setupPending, () => true)) : null,
     ])
@@ -4042,8 +4080,9 @@ Saved to ${out}.md and .json` }
             {' Off '}
           </Text>
         )}
-        {/* The one thing to click: it switches Auto off and on. Text cannot be clicked, so it is a small button. */}
-        <Button key="auto" plain dimColor label=" ⏻ " hover={{ scope: 'power', backgroundColor: HOVER_BOX }} onPress={() => toggleAutoEffort($)} />
+        {/* The one thing to click: it switches Auto off and on. Text cannot be clicked, so it is a small button. A
+            filled or empty circle, which every font has: ⏻ is missing from some Windows fonts and drew as a box. */}
+        <Button key="auto" plain dimColor label={v.auto ? ' ● ' : ' ○ '} hover={{ scope: 'power', backgroundColor: HOVER_BOX }} onPress={() => toggleAutoEffort($)} />
         {/* Until a judge is picked the footer offers the setup; after that the same place opens the settings panel. */}
         {needsSetup ? (
           <Button
@@ -4823,7 +4862,7 @@ Saved to ${out}.md and .json` }
           ...nav(nextButton),
         ])
       }
-      return band('⏻ Auto on or off. ⚙ all settings. Auto pauses on Fable.', 24, [
+      return band('● Auto on, ○ off. ⚙ all settings. Auto pauses on Fable.', 24, [
         ...nav(<Button key="setup-done" variant="primary" autoFocus label="Done" onPress={() => finishSetup($)} />),
       ])
     }
