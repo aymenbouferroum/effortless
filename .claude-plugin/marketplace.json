@@ -1,10 +1,10 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "effortless",
+  "name": "effortless-fork",
   "description": "Automatic reasoning effort and a prompt-cache countdown for Claude Code.",
   "owner": {
-    "name": "HeyCubit",
-    "url": "https://github.com/HeyCubit"
+    "name": "aymenbouferroum",
+    "url": "https://github.com/aymenbouferroum"
   },
   "plugins": [
     {
@@ -12,8 +12,8 @@
       "description": "Sets the reasoning effort for every prompt automatically and shows a prompt-cache countdown with one-click Compact.",
       "source": {
         "source": "url",
-        "url": "https://github.com/HeyCubit/effortless.git",
-        "ref": "stable"
+        "url": "https://github.com/aymenbouferroum/effortless.git",
+        "ref": "integration"
       },
       "category": "productivity"
     }
